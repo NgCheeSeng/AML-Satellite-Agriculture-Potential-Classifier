@@ -1,0 +1,69 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+.conda/
+
+# Local environment and secrets
+.env
+*.env
+secrets/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Codex/local agent workspace state
+.codex/
+.agents/
+
+# Raw incoming and generated dataset artifacts
+raw_to_be_processed/
+data/raw/
+data/processed/
+data/interim/
+data/external/
+
+# Large/generated media and arrays
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.npy
+*.npz
+
+# Trained models and generated outputs
+models/
+outputs/
+*.pkl
+*.joblib
+*.onnx
+
+# Report/export build products
+report/*.docx
+slides/*.pptx
