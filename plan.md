@@ -2,13 +2,13 @@
 
 ## Project Title
 
-**Satellite Image Time-Series Based Agricultural Potential Classification for Future Durian Land Suitability**
+**Satellite Image Time-Series Based Sustainable Agriculture Land Prediction**
 
 ## 1. Project Objective
 
-This project aims to classify the agricultural potential of a land region using Sentinel-2 satellite image time series, elevation data, weather/rainfall indicators, vegetation indices, moisture indicators, and surrounding land-growth features.
+This project aims to predict whether agricultural land remains sustainable for plantation using Sentinel-2 satellite image time series, elevation data, weather/rainfall indicators, vegetation indices, moisture indicators, and surrounding land-growth features.
 
-The final output is a 3-class agricultural potential prediction:
+The final output is a 3-class sustainable agriculture prediction:
 
 1. Low
 2. Moderate
@@ -45,7 +45,7 @@ notebooks/01_video_to_cropped_frames.ipynb
 ```
 
 GEE/environmental features are extracted later and saved into the same processed
-sample folder as `gee_features.csv`.
+sample folder as separate `gee_features.csv` and `gee_targets.csv` files.
 
 ---
 
@@ -78,7 +78,7 @@ Each region includes:
 
 ### Output
 
-A predicted agricultural potential class:
+A predicted sustainable agriculture class:
 
 ```text
 Low / Moderate / High
@@ -146,7 +146,8 @@ aml_durian_agri_potential/
 |       |   |-- frame_000__YYYY-MM-DD.png
 |       |   |-- frame_metadata.csv
 |       |   |-- processing_metadata.json
-|       |   `-- gee_features.csv
+|       |   |-- gee_features.csv
+|       |   `-- gee_targets.csv
 |       |-- moderate/<latitude>_<longitude>/
 |       `-- high/<latitude>_<longitude>/
 |
@@ -227,7 +228,7 @@ processed_at
 gee_features_csv
 ```
 
-`gee_features.csv` is created later by `02_extract_gee_features.ipynb` and saved into the same processed sample folder.
+`gee_features.csv` and `gee_targets.csv` are created later by `02_extract_gee_features.ipynb` and saved into the same processed sample folder.
 ---
 
 ## 7. Feature Engineering
@@ -253,7 +254,7 @@ urban_growth_confidence_bound
 visual_land_change_score
 ```
 
-These values will become additional features for the final agricultural potential classifier.
+These values will become additional features for the final sustainable agriculture classifier.
 
 ### 7.2 Geospatial and Environmental Features
 
@@ -298,7 +299,7 @@ The final model input becomes:
 
 ```text
 X = [urban_growth_probability, NDVI, NDWI, rainfall, temperature, elevation, slope, flood risk, road distance, population context, ...]
-y = agricultural_potential_class
+y = sustainable_agriculture_class
 ```
 
 ---
@@ -379,11 +380,11 @@ Demo process:
 ```text
 1. Place MP4 and timeline TXT in raw_to_be_processed/.
 2. Run 01_video_to_cropped_frames.ipynb to archive raw files and create 5%-cropped PNG frames.
-3. Run 02_extract_gee_features.ipynb to save gee_features.csv in the same processed sample folder.
+3. Run 02_extract_gee_features.ipynb to save gee_features.csv and gee_targets.csv in the same processed sample folder.
 4. Build image time-series and tabular feature inputs.
 5. Predict urban/city growth possibility.
 6. Combine visual and environmental features.
-7. Predict agricultural potential class.
+7. Predict sustainable agriculture class.
 8. Display final result and explanation.
 ```
 
@@ -391,7 +392,7 @@ Demo output example:
 
 ```text
 Region ID: candidate_001
-Predicted class: High agricultural potential
+Predicted class: High sustainable agriculture suitability
 Urban growth risk: Medium
 Flood risk: Low
 Vegetation condition: Good
@@ -403,7 +404,7 @@ Final recommendation: Potentially suitable, but field validation is required.
 
 ## 11. Key Project Limitation
 
-This project does not prove that a region can definitely grow durian. It estimates agricultural potential based on satellite image similarity, environmental features, terrain condition, rainfall, and surrounding development patterns.
+This project does not prove that a region can definitely remain productive for durian or any plantation crop. It estimates sustainable agriculture suitability based on satellite image similarity, environmental features, terrain condition, rainfall, and surrounding development patterns.
 
 Since the image data is downloaded as MP4 and converted into screenshots, the image model uses lossy visual data. Therefore, numerical environmental features from Google Earth Engine and other APIs are necessary to improve reliability.
 
@@ -421,5 +422,21 @@ terrain and flood-risk indicators
 machine learning classification
 ```
 
-The system can help estimate whether a new land region has low, moderate, or high agricultural potential before detailed field investigation.
+The system can help estimate whether a land region has low, moderate, or high sustainable agriculture suitability before detailed field investigation.
 
+
+
+---
+
+## 13. Leakage-Safe GEE Feature Outputs
+
+`02_extract_gee_features.ipynb` must physically separate model inputs from future targets:
+
+```text
+data/processed/<label>/<latitude>_<longitude>/gee_observations.csv
+data/processed/<label>/<latitude>_<longitude>/gee_features.csv   # model X only
+data/processed/<label>/<latitude>_<longitude>/gee_targets.csv    # future/t+1 targets only
+data/processed/<label>/<latitude>_<longitude>/gee_feature_metadata.json
+```
+
+The future/t+1 targets must stay in gee_targets.csv and must never be written into gee_features.csv.

@@ -1,6 +1,6 @@
-# Satellite Agriculture Potential Classifier
+# Satellite Sustainable Agriculture Classifier
 
-This repository contains the source code for an AML final project that builds a satellite image time-series pipeline for classifying Malaysian agricultural land potential into three labels:
+This repository contains the source code for an AML final project that builds a satellite image time-series pipeline for predicting sustainable Malaysian agriculture land into three labels:
 
 ```text
 low / moderate / high
@@ -9,7 +9,7 @@ low / moderate / high
 The source code is hosted on GitHub:
 
 ```text
-git@github.com:NgCheeSeng/AML-Satellite-Agriculture-Potential-Classifier.git
+git@github.com:NgCheeSeng/AML-Satellite-Sustainable-Agriculture-Classifier.git
 ```
 
 The dataset is hosted separately on Hugging Face:
@@ -32,19 +32,21 @@ data/
     frame_000__YYYY-MM-DD.png
     frame_metadata.csv
     processing_metadata.json
-    gee_features.csv
+    gee_observations.csv
+    gee_features.csv        # model X only
+    gee_targets.csv         # future/t+1 targets only
+    gee_feature_metadata.json
 
 notebooks/
   01_video_to_cropped_frames.ipynb
+  02_extract_gee_features.ipynb
 
 src/
   preprocessing/process_raw_videos.py
-
-scripts/
-  upload_dataset_to_hf.py
+  features/gee_features.py
 ```
 
-The `data/` and `raw_to_be_processed/` folders are intentionally ignored by Git. Dataset files should be shared through Hugging Face, not committed to GitHub.
+The `data/` and `raw_to_be_processed/` folders are intentionally ignored by Git. Dataset files should be pulled from Hugging Face, not committed to GitHub.
 
 ## Environment Setup
 
@@ -60,6 +62,30 @@ Or run commands without activating:
 ```powershell
 conda run -n aml python -m pip install -r requirements.txt
 ```
+
+## Pull Dataset from Hugging Face
+
+The project dataset is stored in:
+
+```text
+Aki298/AML-Satellite-Imagery-Malaysia-Copernicus
+```
+
+Download the dataset into the local `data/` folder:
+
+```powershell
+conda run -n aml python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Aki298/AML-Satellite-Imagery-Malaysia-Copernicus', repo_type='dataset', local_dir='data', allow_patterns=['raw/**','processed/**'])"
+```
+
+After pulling, the expected local dataset structure is:
+
+```text
+data/
+  raw/
+  processed/
+```
+
+If `data/` already exists, Hugging Face will update matching downloaded files, but local files that no longer exist in the remote dataset may remain. For a clean refresh, move or remove the old local `data/` folder before downloading again.
 
 ## Preprocess MP4 Samples
 
@@ -98,47 +124,38 @@ It saves 5%-cropped PNG frames and metadata into:
 data/processed/<label>/<latitude>_<longitude>/
 ```
 
-## Upload Dataset to Hugging Face
-
-Authenticate once with a Hugging Face token that has write permission for the dataset repo:
-
-```powershell
-conda run -n aml hf auth login
-```
-
-Preview files before upload:
-
-```powershell
-conda run -n aml python scripts/upload_dataset_to_hf.py --dry-run
-```
-
-Upload `data/` to the dataset repository:
-
-```powershell
-conda run -n aml python scripts/upload_dataset_to_hf.py
-```
-
-The script defaults to:
+It also rebuilds the central sample index used by the GEE pipeline:
 
 ```text
-Aki298/AML-Satellite-Imagery-Malaysia-Copernicus
+data/processed/sample_index.csv
 ```
 
-You can also use `HF_TOKEN` instead of `hf auth login`:
-
-```powershell
-$env:HF_TOKEN="your_token_here"
-conda run -n aml python scripts/upload_dataset_to_hf.py
-```
-
-For very large future uploads, use the Hugging Face large-folder uploader:
-
-```powershell
-conda run -n aml hf upload-large-folder Aki298/AML-Satellite-Imagery-Malaysia-Copernicus --repo-type=dataset data --num-workers=8
-```
 
 ## Notes
 
 - Labels are `low`, `moderate`, and `high`.
 - Current frame extraction crops 5% from each border to remove browser overlay/watermark areas.
-- `gee_features.csv` is created later by the Google Earth Engine feature extraction notebook and should be saved inside the same processed sample folder.
+- `02_extract_gee_features.ipynb` creates `gee_observations.csv`, leakage-safe model inputs in `gee_features.csv`, future/t+1 targets in `gee_targets.csv`, and reproducibility details in `gee_feature_metadata.json`.
+
+
+## Extract GEE Features
+
+Set your Google Earth Engine project ID before launching Jupyter, then run notebook 02:
+
+```powershell
+$env:GEE_PROJECT_ID="your-gee-project-id"
+jupyter notebook
+```
+
+If Jupyter is already running, set `GEE_PROJECT_ID` directly in the first config cell of `02_extract_gee_features.ipynb` and rerun the initialization cell.
+
+`02_extract_gee_features.ipynb` writes per-sample files under `data/processed/<label>/<latitude>_<longitude>/`:
+
+```text
+gee_observations.csv
+gee_features.csv
+gee_targets.csv
+gee_feature_metadata.json
+```
+
+`gee_features.csv` contains model input features only. `gee_targets.csv` contains future/t+1 target columns only, so future data cannot accidentally leak into training inputs.

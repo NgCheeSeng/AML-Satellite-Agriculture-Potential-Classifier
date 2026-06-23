@@ -26,6 +26,22 @@ from typing import Iterable
 
 
 LABELS = {"low", "moderate", "high"}
+SAMPLE_INDEX_FIELDS = [
+    "sample_id",
+    "label",
+    "latitude",
+    "longitude",
+    "processed_dir",
+    "frame_count",
+    "start_date",
+    "end_date",
+    "frame_metadata_csv",
+    "processing_metadata_json",
+    "gee_observations_csv",
+    "gee_features_csv",
+    "gee_targets_csv",
+    "gee_feature_metadata_json",
+]
 VIDEO_RE = re.compile(
     r"^(?P<latitude>-?\d+(?:\.\d+)?)_(?P<longitude>-?\d+(?:\.\d+)?)_"
     r"(?P<label>low|moderate|high)\.mp4$",
@@ -42,8 +58,16 @@ class RawSample:
     timeline_path: Path
 
     @property
-    def sample_id(self) -> str:
+    def coordinate_id(self) -> str:
         return f"{self.latitude}_{self.longitude}"
+
+    @property
+    def sample_id(self) -> str:
+        return build_sample_id(self.latitude, self.longitude, self.label)
+
+
+def build_sample_id(latitude: str | float, longitude: str | float, label: str) -> str:
+    return f"{latitude}_{longitude}_{label.lower()}"
 
 
 def parse_video_name(video_path: Path) -> tuple[str, str, str]:
@@ -106,11 +130,11 @@ def discover_samples(inbox_dir: Path) -> list[RawSample]:
 
 
 def archive_raw_files(sample: RawSample, data_dir: Path) -> tuple[Path, Path, Path]:
-    raw_dir = data_dir / "raw" / sample.label / sample.sample_id
+    raw_dir = data_dir / "raw" / sample.label / sample.coordinate_id
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     archived_video = raw_dir / sample.video_path.name
-    archived_timeline = raw_dir / f"{sample.sample_id}.txt"
+    archived_timeline = raw_dir / f"{sample.coordinate_id}.txt"
     shutil.copy2(sample.video_path, archived_video)
     shutil.copy2(sample.timeline_path, archived_timeline)
     return raw_dir, archived_video, archived_timeline
@@ -164,11 +188,12 @@ def extract_cropped_frames(
     force: bool = False,
 ) -> dict:
     dates = read_timeline(sample.timeline_path)
-    processed_dir = data_dir / "processed" / sample.label / sample.sample_id
+    processed_dir = data_dir / "processed" / sample.label / sample.coordinate_id
 
     if not force and is_processed(processed_dir, dates, crop_percent):
         return {
             "sample_id": sample.sample_id,
+            "coordinate_id": sample.coordinate_id,
             "label": sample.label,
             "status": "skipped",
             "reason": "already processed",
@@ -246,6 +271,7 @@ def extract_cropped_frames(
         "longitude": float(sample.longitude),
         "label": sample.label,
         "sample_id": sample.sample_id,
+        "coordinate_id": sample.coordinate_id,
         "raw_dir": str(raw_dir),
         "raw_video": str(archived_video),
         "raw_timeline": str(archived_timeline),
@@ -254,13 +280,97 @@ def extract_cropped_frames(
         "crop_percent": crop_percent,
         "status": "processed",
         "processed_at": datetime.now(timezone.utc).isoformat(),
+        "gee_observations_csv": str(processed_dir / "gee_observations.csv"),
         "gee_features_csv": str(processed_dir / "gee_features.csv"),
+        "gee_targets_csv": str(processed_dir / "gee_targets.csv"),
+        "gee_feature_metadata_json": str(processed_dir / "gee_feature_metadata.json"),
     }
     (processed_dir / "processing_metadata.json").write_text(
         json.dumps(metadata, indent=2),
         encoding="utf-8",
     )
     return metadata
+
+
+def _load_processing_metadata(metadata_path: Path) -> dict:
+    try:
+        return json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON metadata file: {metadata_path}") from exc
+
+
+def _read_frame_dates(frame_metadata_path: Path) -> tuple[int, str, str]:
+    if not frame_metadata_path.exists():
+        return 0, "", ""
+    with frame_metadata_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    dates = [row.get("acquisition_date", "") for row in rows if row.get("acquisition_date")]
+    if not dates:
+        return len(rows), "", ""
+    return len(rows), min(dates), max(dates)
+
+
+def build_sample_index(data_dir: str | Path = "data") -> list[dict[str, str | int | float]]:
+    data_path = Path(data_dir)
+    processed_root = data_path / "processed"
+    rows: list[dict[str, str | int | float]] = []
+
+    for label in sorted(LABELS):
+        label_dir = processed_root / label
+        if not label_dir.exists():
+            continue
+        for sample_dir in sorted(path for path in label_dir.iterdir() if path.is_dir()):
+            metadata_path = sample_dir / "processing_metadata.json"
+            if not metadata_path.exists():
+                continue
+            metadata = _load_processing_metadata(metadata_path)
+            coordinate_id = str(metadata.get("coordinate_id") or sample_dir.name)
+            latitude = metadata.get("latitude")
+            longitude = metadata.get("longitude")
+            if latitude is None or longitude is None:
+                try:
+                    latitude_text, longitude_text = coordinate_id.split("_", 1)
+                    latitude = float(latitude_text)
+                    longitude = float(longitude_text)
+                except ValueError:
+                    latitude = ""
+                    longitude = ""
+            frame_metadata_path = sample_dir / "frame_metadata.csv"
+            frame_count, start_date, end_date = _read_frame_dates(frame_metadata_path)
+            if not frame_count:
+                frame_count = int(metadata.get("frame_count", 0) or 0)
+            rows.append(
+                {
+                    "sample_id": build_sample_id(latitude, longitude, label),
+                    "label": label,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "processed_dir": str(sample_dir),
+                    "frame_count": frame_count,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "frame_metadata_csv": str(frame_metadata_path),
+                    "processing_metadata_json": str(metadata_path),
+                    "gee_observations_csv": str(sample_dir / "gee_observations.csv"),
+                    "gee_features_csv": str(sample_dir / "gee_features.csv"),
+                    "gee_targets_csv": str(sample_dir / "gee_targets.csv"),
+                    "gee_feature_metadata_json": str(sample_dir / "gee_feature_metadata.json"),
+                }
+            )
+    return rows
+
+
+def write_sample_index(data_dir: str | Path = "data") -> Path:
+    data_path = Path(data_dir)
+    processed_root = data_path / "processed"
+    processed_root.mkdir(parents=True, exist_ok=True)
+    index_path = processed_root / "sample_index.csv"
+    rows = build_sample_index(data_path)
+    with index_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SAMPLE_INDEX_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return index_path
 
 
 def process_inbox(
@@ -285,6 +395,7 @@ def process_inbox(
                 force=force,
             )
         )
+    write_sample_index(data_path)
     return results
 
 
@@ -296,7 +407,17 @@ def main() -> None:
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--crop-percent", type=float, default=5.0)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--write-sample-index-only",
+        action="store_true",
+        help="Rebuild data/processed/sample_index.csv without processing inbox videos.",
+    )
     args = parser.parse_args()
+
+    if args.write_sample_index_only:
+        index_path = write_sample_index(args.data_dir)
+        print(json.dumps({"sample_index_csv": str(index_path)}, indent=2))
+        return
 
     results = process_inbox(
         inbox_dir=args.inbox,

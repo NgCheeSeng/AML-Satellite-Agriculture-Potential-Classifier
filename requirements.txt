@@ -1,2 +1,7 @@
 opencv-python
 huggingface_hub
+earthengine-api
+geemap
+pandas
+numpy
+tqdm
