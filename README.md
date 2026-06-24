@@ -115,7 +115,7 @@ If `data/` already exists, Hugging Face updates matching downloaded files, but l
    - Future final classifier stage.
    - Current implementation only reads and merges GEE features, GEE targets, and optional image results.
    - No model training is implemented yet.
-
+~
 ## Important Rules
 
 - Raw GEE observations stay in `data/raw` and are not modified by feature engineering.
