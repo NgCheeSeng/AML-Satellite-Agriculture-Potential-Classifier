@@ -1,4 +1,4 @@
-﻿"""Feature extraction helpers for sustainable agriculture modeling.
+"""Feature extraction helpers for sustainable agriculture modeling.
 
 Future/t+1 values are written only to gee_targets.csv. They are never written to
 gee_features.csv, so model input files cannot silently include future data.
@@ -35,20 +35,36 @@ OBSERVATION_COLUMNS = ID_COLUMNS + [
     "built_probability_1km", "built_probability_5km", "flooded_vegetation_probability", "dynamicworld_image_count",
     "water_occurrence_mean", "max_water_extent_fraction",
 ]
+OPTICAL_COLUMNS = ["ndvi_mean", "evi_mean", "ndwi_mean", "ndmi_mean"]
+SAR_COLUMNS = ["vv_mean_db", "vh_mean_db", "vv_minus_vh_db"]
+CLIMATE_COLUMNS = [
+    "rainfall_30d_mm", "rainfall_90d_mm", "dry_days_30d", "heavy_rain_days_30d", "heavy_rain_days_90d",
+    "temperature_2m_mean_c", "relative_humidity_mean_pct", "soil_water_layer1_mean", "surface_runoff_30d_m",
+]
+CONTEXT_COLUMNS = [
+    "built_probability_1km", "built_probability_5km", "flooded_vegetation_probability",
+    "water_occurrence_mean", "max_water_extent_fraction", "elevation_m", "slope_deg", "lowland_flag",
+]
+IMPUTE_COLUMNS = OPTICAL_COLUMNS + SAR_COLUMNS + CLIMATE_COLUMNS + CONTEXT_COLUMNS
 FEATURE_COLUMNS = ID_COLUMNS + [
-    "ndvi_lag_1", "ndvi_lag_2", "ndvi_rolling_mean_3", "ndvi_trend",
-    "evi_lag_1", "evi_lag_2", "evi_rolling_mean_3", "evi_trend",
-    "built_growth_rate", "built_growth_trend", "rainfall_rolling_mean_3", "heavy_rain_rolling_sum_3",
-    "sar_moisture_trend", "flood_risk_proxy_score",
+    "month_sin", "month_cos",
+    "optical_imputed_flag", "sar_imputed_flag", "climate_imputed_flag", "any_imputed_flag", "leading_backfill_flag",
+    "ndvi_lag_1", "ndvi_lag_2", "ndvi_rolling_mean_3", "ndvi_rolling_std_3", "ndvi_rolling_mean_5", "ndvi_rolling_std_5", "ndvi_trend",
+    "evi_lag_1", "evi_lag_2", "evi_rolling_mean_3", "evi_rolling_std_3", "evi_rolling_mean_5", "evi_rolling_std_5", "evi_trend",
+    "built_growth_rate", "built_growth_trend", "urban_encroachment_index",
+    "rainfall_rolling_mean_3", "heavy_rain_rolling_sum_3", "rain_to_green_ratio",
+    "sar_moisture_trend", "vv_vh_ratio_linear", "flood_risk_proxy_score",
 ]
 TARGET_COLUMNS = [
     "sample_id", "label", "frame_index", "acquisition_date", "target_date",
-    "target_ndvi_delta_1", "target_evi_delta_1", "target_built_delta_1", "target_sustainability_proxy_score",
+    "target_ndvi_delta_1", "target_evi_delta_1", "target_built_delta_1",
+    "target_sustainability_proxy_score", "target_available_flag", "target_uses_imputed_observation",
 ]
-
 
 @dataclass(frozen=True)
 class FeatureExtractionConfig:
+    """Settings for slow Google Earth Engine observation fetching."""
+
     gee_project_id: str | None = None
     data_dir: str = "data"
     sample_index_csv: str = "data/processed/sample_index.csv"
@@ -68,8 +84,22 @@ class FeatureExtractionConfig:
     def project_id(self) -> str | None:
         return self.gee_project_id or os.environ.get("GEE_PROJECT_ID") or None
 
+@dataclass(frozen=True)
+class FeatureEngineeringConfig:
+    """Settings for local feature and target engineering."""
+
+    data_dir: str = "data"
+    sample_index_csv: str = "data/processed/sample_index.csv"
+    force: bool = True
+    verbose: bool = True
+    ffill_enabled: bool = True
+    leading_bfill_limit: int = 2
+    epsilon: float = 1e-6
+
 
 def initialize_earth_engine(project_id: str | None = None):
+    """Authenticate and initialize the Earth Engine Python API."""
+
     import ee
 
     resolved_project = project_id or os.environ.get("GEE_PROJECT_ID") or None
@@ -87,26 +117,83 @@ def initialize_earth_engine(project_id: str | None = None):
     return ee
 
 
+def project_root_from_sample_index(sample_index_csv: str | Path) -> Path:
+    """Infer the project root from the sample index location."""
+
+    sample_index_path = Path(sample_index_csv).resolve()
+    if (
+        sample_index_path.name == "sample_index.csv"
+        and sample_index_path.parent.name == "processed"
+        and sample_index_path.parent.parent.name == "data"
+    ):
+        return sample_index_path.parent.parent.parent
+    return Path.cwd().resolve()
+
+
+def resolve_project_path(path: str | Path, project_root: str | Path | None = None) -> Path:
+    """Resolve project-relative paths without changing stored CSV values."""
+
+    value = str(path).strip()
+    candidate = Path(value)
+    if candidate.is_absolute() and not value.startswith(("\\", "/")):
+        return candidate
+    if value.startswith(("\\", "/")):
+        value = value.lstrip("\\/")
+        candidate = Path(value)
+    root = Path(project_root).resolve() if project_root is not None else Path.cwd().resolve()
+    return root / candidate
+
+
+def project_relative_path(path: str | Path, project_root: str | Path) -> str:
+    """Format a path relative to the project root when possible."""
+
+    resolved_path = Path(path).resolve()
+    resolved_root = Path(project_root).resolve()
+    try:
+        return str(resolved_path.relative_to(resolved_root))
+    except ValueError:
+        return str(path)
+
+
+def display_project_path(path: str | Path, project_root: str | Path | None = None) -> str:
+    """Return a privacy-safe path for logs and error messages."""
+
+    if project_root is None:
+        project_root = Path.cwd()
+    return project_relative_path(resolve_project_path(path, project_root), project_root)
+
+
 def load_sample_index(path: str | Path) -> pd.DataFrame:
+    """Load sample_index.csv and attach the inferred project root."""
+
     path = Path(path)
+    project_root = project_root_from_sample_index(path)
     if not path.exists():
-        raise FileNotFoundError(f"Missing sample index: {path}")
-    return pd.read_csv(path)
+        raise FileNotFoundError(f"Missing sample index: {display_project_path(path, project_root)}")
+    sample_index = pd.read_csv(path)
+    sample_index.attrs["project_root"] = project_root
+    return sample_index
 
 
-def load_frame_metadata(path: str | Path) -> pd.DataFrame:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Missing frame metadata: {path}")
-    return pd.read_csv(path)
+def load_frame_metadata(path: str | Path, project_root: str | Path | None = None) -> pd.DataFrame:
+    """Load one sample frame_metadata.csv from a relative or absolute path."""
+
+    resolved_path = resolve_project_path(path, project_root)
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Missing frame metadata: {display_project_path(resolved_path, project_root)}")
+    return pd.read_csv(resolved_path)
 
 
-def _log(config: FeatureExtractionConfig, message: str) -> None:
+def _log(config: FeatureExtractionConfig | FeatureEngineeringConfig, message: str) -> None:
+    """Print a message when verbose mode is enabled."""
+
     if config.verbose:
         print(message, flush=True)
 
 
-def _progress(iterable: Any, *, total: int | None, desc: str, config: FeatureExtractionConfig, leave: bool = True) -> Any:
+def _progress(iterable: Any, *, total: int | None, desc: str, config: FeatureExtractionConfig | FeatureEngineeringConfig, leave: bool = True) -> Any:
+    """Wrap an iterable with tqdm when available and verbose mode is on."""
+
     if not config.verbose:
         return iterable
     try:
@@ -117,6 +204,8 @@ def _progress(iterable: Any, *, total: int | None, desc: str, config: FeatureExt
 
 
 def _timed_group(config: FeatureExtractionConfig, sample_id: str, acquisition_date: str, group_name: str, extractor: Any) -> dict[str, Any]:
+    """Run one GEE feature group with optional timing logs."""
+
     if config.log_feature_groups:
         _log(config, f"      {sample_id} {acquisition_date}: {group_name} start")
     started_at = time.perf_counter()
@@ -127,69 +216,54 @@ def _timed_group(config: FeatureExtractionConfig, sample_id: str, acquisition_da
     return result
 
 
-def extract_all_samples(config: FeatureExtractionConfig, sample_limit: int | None = None, ee_module: Any | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+def extract_raw_observations_from_gee(config: FeatureExtractionConfig, sample_limit: int | None = None, ee_module: Any | None = None) -> list[Path]:
+    """Fetch raw GEE observations only and write them under data/raw."""
     ee = ee_module or initialize_earth_engine(config.project_id)
     sample_index = load_sample_index(config.sample_index_csv)
+    project_root = sample_index.attrs.get("project_root", project_root_from_sample_index(config.sample_index_csv))
     if sample_limit is not None:
         sample_index = sample_index.head(sample_limit)
-
-    total_samples = len(sample_index)
-    _log(config, f"Starting GEE extraction: {total_samples} sample(s), project={config.project_id}")
-    _log(config, f"Outputs will be written under: {Path(config.data_dir) / 'processed'}")
-
-    feature_frames: list[pd.DataFrame] = []
-    target_frames: list[pd.DataFrame] = []
-    sample_iter = _progress(sample_index.iterrows(), total=total_samples, desc="GEE samples", config=config)
+    _log(config, f"Starting raw GEE observation fetch: {len(sample_index)} sample(s), project={config.project_id}")
+    written_paths: list[Path] = []
+    sample_iter = _progress(sample_index.iterrows(), total=len(sample_index), desc="GEE samples", config=config)
     for sample_number, (_, sample) in enumerate(sample_iter, start=1):
         sample_id = str(sample["sample_id"])
-        sample_started_at = time.perf_counter()
-        _log(config, f"[{sample_number}/{total_samples}] {sample_id}: start")
+        output_path = resolve_project_path(sample["gee_observations_csv"], project_root)
+        metadata_path = resolve_project_path(sample["gee_feature_metadata_json"], project_root)
+        _log(config, f"[{sample_number}/{len(sample_index)}] {sample_id}: raw observation fetch start")
+        if output_path.exists() and not config.force:
+            _log(config, f"    {sample_id}: using cached raw observations from {display_project_path(output_path, project_root)}")
+            written_paths.append(output_path)
+            continue
         observations = extract_sample_observations(sample, config, ee)
-        _log(config, f"[{sample_number}/{total_samples}] {sample_id}: building temporal features/targets")
-        features, targets = build_features_and_targets(observations)
-        write_sample_outputs(sample, observations, features, targets, config)
-        feature_frames.append(features)
-        target_frames.append(targets)
-        elapsed = time.perf_counter() - sample_started_at
-        _log(config, f"[{sample_number}/{total_samples}] {sample_id}: done ({len(observations)} frame rows, {elapsed:.1f}s)")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        observations.to_csv(output_path, index=False)
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(json.dumps(build_feature_metadata(sample, observations, config), indent=2), encoding="utf-8")
+        written_paths.append(output_path)
+        _log(config, f"    {sample_id}: wrote {len(observations)} raw rows")
+    return written_paths
 
-    features_all = pd.concat(feature_frames, ignore_index=True) if feature_frames else pd.DataFrame(columns=FEATURE_COLUMNS)
-    targets_all = pd.concat(target_frames, ignore_index=True) if target_frames else pd.DataFrame(columns=TARGET_COLUMNS)
-    assert_no_target_leakage(features_all)
-
-    processed_root = Path(config.data_dir) / "processed"
-    processed_root.mkdir(parents=True, exist_ok=True)
-    features_path = processed_root / "gee_features_all.csv"
-    targets_path = processed_root / "gee_targets_all.csv"
-    features_all.to_csv(features_path, index=False)
-    targets_all.to_csv(targets_path, index=False)
-    _log(config, f"Saved combined features: {features_path} ({len(features_all)} rows)")
-    _log(config, f"Saved combined targets: {targets_path} ({len(targets_all)} rows)")
-    return features_all, targets_all
 
 def extract_sample_observations(sample: pd.Series, config: FeatureExtractionConfig, ee: Any) -> pd.DataFrame:
-    output_path = Path(str(sample["gee_observations_csv"]))
-    sample_id = str(sample["sample_id"])
-    if output_path.exists() and not config.force:
-        _log(config, f"    {sample_id}: using cached observations from {output_path}")
-        return pd.read_csv(output_path)
+    """Fetch raw GEE observations for every frame in one sample."""
 
-    frame_metadata = load_frame_metadata(sample["frame_metadata_csv"])
-    total_frames = len(frame_metadata)
-    _log(config, f"    {sample_id}: extracting {total_frames} frame date(s)")
+    sample_id = str(sample["sample_id"])
+    frame_metadata = load_frame_metadata(
+        sample["frame_metadata_csv"],
+        project_root_from_sample_index(config.sample_index_csv),
+    )
     rows = []
-    frame_iter = _progress(frame_metadata.iterrows(), total=total_frames, desc=f"{sample_id} frames", config=config, leave=False)
+    frame_iter = _progress(frame_metadata.iterrows(), total=len(frame_metadata), desc=f"{sample_id} frames", config=config, leave=False)
     for frame_number, (_, frame) in enumerate(frame_iter, start=1):
         acquisition_date = str(frame["acquisition_date"])
-        frame_started_at = time.perf_counter()
-        _log(config, f"    {sample_id}: frame {frame_number}/{total_frames} {acquisition_date} start")
+        _log(config, f"    {sample_id}: frame {frame_number}/{len(frame_metadata)} {acquisition_date} start")
         rows.append(extract_observation(sample, frame, acquisition_date, config, ee))
-        elapsed = time.perf_counter() - frame_started_at
-        _log(config, f"    {sample_id}: frame {frame_number}/{total_frames} {acquisition_date} done ({elapsed:.1f}s)")
     return pd.DataFrame(rows, columns=OBSERVATION_COLUMNS)
 
-
 def extract_observation(sample: pd.Series, frame: pd.Series, acquisition_date: str, config: FeatureExtractionConfig, ee: Any) -> dict[str, Any]:
+    """Fetch all raw GEE feature groups for one coordinate-date row."""
+
     latitude = float(sample["latitude"])
     longitude = float(sample["longitude"])
     point = ee.Geometry.Point([longitude, latitude])
@@ -216,57 +290,155 @@ def extract_observation(sample: pd.Series, frame: pd.Series, acquisition_date: s
     return {column: row.get(column, np.nan) for column in OBSERVATION_COLUMNS}
 
 
-def build_features_and_targets(observations: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def engineer_all_samples(config: FeatureEngineeringConfig, sample_limit: int | None = None) -> pd.DataFrame:
+    """Create per-sample gee_features.csv and gee_targets.csv files."""
+
+    sample_index = load_sample_index(config.sample_index_csv)
+    project_root = sample_index.attrs.get("project_root", project_root_from_sample_index(config.sample_index_csv))
+    if sample_limit is not None:
+        sample_index = sample_index.head(sample_limit)
+    summaries: list[dict[str, Any]] = []
+    sample_iter = _progress(sample_index.iterrows(), total=len(sample_index), desc="Feature engineering", config=config)
+    for _, sample in sample_iter:
+        sample_id = str(sample["sample_id"])
+        observations_path = resolve_project_path(sample["gee_observations_csv"], project_root)
+        if not observations_path.exists():
+            raise FileNotFoundError(f"Missing raw GEE observations for {sample_id}: {display_project_path(observations_path, project_root)}")
+        features_path = resolve_project_path(sample["gee_features_csv"], project_root)
+        targets_path = resolve_project_path(sample["gee_targets_csv"], project_root)
+        if features_path.exists() and targets_path.exists() and not config.force:
+            _log(config, f"    {sample_id}: using cached engineered outputs")
+        else:
+            observations = pd.read_csv(observations_path)
+            features, targets = engineer_features_and_targets(observations, config)
+            write_engineered_outputs(sample, features, targets, project_root)
+            _log(config, f"    {sample_id}: wrote {len(features)} feature rows and {len(targets)} target rows")
+        summaries.append({
+            "sample_id": sample_id,
+            "label": sample["label"],
+            "gee_observations_csv": project_relative_path(observations_path, project_root),
+            "gee_features_csv": project_relative_path(features_path, project_root),
+            "gee_targets_csv": project_relative_path(targets_path, project_root),
+        })
+    return pd.DataFrame(summaries)
+
+
+def engineer_features_and_targets(observations: pd.DataFrame, config: FeatureEngineeringConfig | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Convert raw observations into leakage-separated features and targets."""
+
+    config = config or FeatureEngineeringConfig()
     if observations.empty:
         return pd.DataFrame(columns=FEATURE_COLUMNS), pd.DataFrame(columns=TARGET_COLUMNS)
-
-    df = observations.sort_values(["sample_id", "acquisition_date"]).copy()
+    df = observations.reindex(columns=OBSERVATION_COLUMNS).copy()
+    df["acquisition_date"] = pd.to_datetime(df["acquisition_date"], errors="coerce")
+    df = df.sort_values(["sample_id", "acquisition_date", "frame_index"]).reset_index(drop=True)
+    df = apply_leakage_safe_imputation(df, config)
     group = df.groupby("sample_id", group_keys=False)
     features = df[ID_COLUMNS].copy()
-
+    features["acquisition_date"] = features["acquisition_date"].dt.date.astype(str)
+    month = df["acquisition_date"].dt.month.astype(float)
+    features["month_sin"] = np.sin(2 * np.pi * month / 12.0)
+    features["month_cos"] = np.cos(2 * np.pi * month / 12.0)
+    for flag in ["optical_imputed_flag", "sar_imputed_flag", "climate_imputed_flag", "any_imputed_flag", "leading_backfill_flag"]:
+        features[flag] = df[flag].astype(int)
     for prefix in ["ndvi", "evi"]:
         source = f"{prefix}_mean"
-        features[f"{prefix}_lag_1"] = group[source].shift(1)
-        features[f"{prefix}_lag_2"] = group[source].shift(2)
+        lag_1 = group[source].shift(1)
+        lag_2 = group[source].shift(2)
+        features[f"{prefix}_lag_1"] = lag_1.fillna(df[source])
+        features[f"{prefix}_lag_2"] = lag_2.fillna(features[f"{prefix}_lag_1"])
         features[f"{prefix}_rolling_mean_3"] = group[source].transform(lambda s: s.rolling(3, min_periods=1).mean())
-        features[f"{prefix}_trend"] = group[source].transform(lambda s: s.diff(2) / 2.0)
-
-    features["built_growth_rate"] = group["built_probability_5km"].diff()
-    features["built_growth_trend"] = group["built_probability_5km"].transform(lambda s: s.diff().rolling(3, min_periods=1).mean())
+        features[f"{prefix}_rolling_std_3"] = group[source].transform(lambda s: s.rolling(3, min_periods=1).std()).fillna(0.0)
+        features[f"{prefix}_rolling_mean_5"] = group[source].transform(lambda s: s.rolling(5, min_periods=1).mean())
+        features[f"{prefix}_rolling_std_5"] = group[source].transform(lambda s: s.rolling(5, min_periods=1).std()).fillna(0.0)
+        features[f"{prefix}_trend"] = group[source].transform(lambda s: s.diff(2) / 2.0).fillna(0.0)
+    built = df["built_probability_5km"]
+    built_group = group["built_probability_5km"]
+    features["built_growth_rate"] = built_group.diff().fillna(0.0)
+    features["built_growth_trend"] = built_group.transform(lambda s: s.diff().rolling(3, min_periods=1).mean()).fillna(0.0)
+    features["urban_encroachment_index"] = built - df["built_probability_1km"]
     features["rainfall_rolling_mean_3"] = group["rainfall_30d_mm"].transform(lambda s: s.rolling(3, min_periods=1).mean())
     features["heavy_rain_rolling_sum_3"] = group["heavy_rain_days_30d"].transform(lambda s: s.rolling(3, min_periods=1).sum())
-    features["sar_moisture_trend"] = group["vh_mean_db"].transform(lambda s: s.diff(2) / 2.0)
+    rainfall_lag = group["rainfall_30d_mm"].shift(1).fillna(df["rainfall_30d_mm"])
+    features["rain_to_green_ratio"] = df["ndvi_mean"] / (rainfall_lag.abs() + config.epsilon)
+    features["sar_moisture_trend"] = group["vh_mean_db"].transform(lambda s: s.diff(2) / 2.0).fillna(0.0)
+    features["vv_vh_ratio_linear"] = np.power(10.0, df["vv_minus_vh_db"] / 10.0)
     features["flood_risk_proxy_score"] = _flood_risk_proxy(df)
     features = features.reindex(columns=FEATURE_COLUMNS)
     assert_no_target_leakage(features)
-
-    targets = df[["sample_id", "label", "frame_index", "acquisition_date"]].copy()
-    targets["target_date"] = group["acquisition_date"].shift(-1)
+    targets = df[["sample_id", "label", "frame_index"]].copy()
+    targets["acquisition_date"] = df["acquisition_date"].dt.date.astype(str)
+    target_date = group["acquisition_date"].shift(-1)
+    targets["target_date"] = target_date.dt.date.astype(str).where(target_date.notna(), pd.NA)
     targets["target_ndvi_delta_1"] = group["ndvi_mean"].shift(-1) - df["ndvi_mean"]
     targets["target_evi_delta_1"] = group["evi_mean"].shift(-1) - df["evi_mean"]
     targets["target_built_delta_1"] = group["built_probability_5km"].shift(-1) - df["built_probability_5km"]
-    targets["target_sustainability_proxy_score"] = (
-        targets["target_ndvi_delta_1"].fillna(0)
-        + targets["target_evi_delta_1"].fillna(0)
-        - targets["target_built_delta_1"].fillna(0)
-        - features["flood_risk_proxy_score"].fillna(0) * 0.1
-    )
+    targets["target_sustainability_proxy_score"] = targets["target_ndvi_delta_1"] + targets["target_evi_delta_1"] - targets["target_built_delta_1"] - features["flood_risk_proxy_score"].fillna(0) * 0.1
+    targets["target_available_flag"] = targets["target_date"].notna().astype(int)
+    next_imputed = group["any_imputed_flag"].shift(-1).fillna(0).astype(int)
+    targets["target_uses_imputed_observation"] = ((df["any_imputed_flag"].astype(int) == 1) | (next_imputed == 1)).astype(int)
     return features, targets.reindex(columns=TARGET_COLUMNS)
 
 
-def write_sample_outputs(sample: pd.Series, observations: pd.DataFrame, features: pd.DataFrame, targets: pd.DataFrame, config: FeatureExtractionConfig) -> None:
-    observations_path = Path(str(sample["gee_observations_csv"]))
-    features_path = Path(str(sample["gee_features_csv"]))
-    targets_path = Path(str(sample["gee_targets_csv"]))
-    metadata_path = Path(str(sample["gee_feature_metadata_json"]))
-    observations_path.parent.mkdir(parents=True, exist_ok=True)
-    observations.to_csv(observations_path, index=False)
+def apply_leakage_safe_imputation(df: pd.DataFrame, config: FeatureEngineeringConfig) -> pd.DataFrame:
+    """Fill missing observations within each sample without creating target columns."""
+
+    working = df.copy()
+    for column in IMPUTE_COLUMNS:
+        if column not in working.columns:
+            working[column] = np.nan
+        working[column] = pd.to_numeric(working[column], errors="coerce")
+    working["optical_imputed_flag"] = working[OPTICAL_COLUMNS].isna().any(axis=1).astype(int)
+    working["sar_imputed_flag"] = working[SAR_COLUMNS].isna().any(axis=1).astype(int)
+    working["climate_imputed_flag"] = working[CLIMATE_COLUMNS].isna().any(axis=1).astype(int)
+    working["any_imputed_flag"] = working[["optical_imputed_flag", "sar_imputed_flag", "climate_imputed_flag"]].any(axis=1).astype(int)
+    after_ffill = working.groupby("sample_id", group_keys=False)[IMPUTE_COLUMNS].ffill() if config.ffill_enabled else working[IMPUTE_COLUMNS].copy()
+    after_fill = after_ffill.groupby(working["sample_id"], group_keys=False).bfill(limit=config.leading_bfill_limit)
+    working[IMPUTE_COLUMNS] = after_fill
+    working["leading_backfill_flag"] = (after_ffill.isna() & after_fill.notna()).any(axis=1).astype(int)
+    static_columns = ["elevation_m", "slope_deg", "lowland_flag", "water_occurrence_mean", "max_water_extent_fraction"]
+    working[static_columns] = working.groupby("sample_id", group_keys=False)[static_columns].ffill()
+    working[static_columns] = working.groupby("sample_id", group_keys=False)[static_columns].bfill()
+    return working
+
+
+def write_engineered_outputs(sample: pd.Series, features: pd.DataFrame, targets: pd.DataFrame, project_root: str | Path | None = None) -> None:
+    """Write one sample's engineered feature and target tables."""
+
+    features_path = resolve_project_path(sample["gee_features_csv"], project_root)
+    targets_path = resolve_project_path(sample["gee_targets_csv"], project_root)
+    features_path.parent.mkdir(parents=True, exist_ok=True)
     features.to_csv(features_path, index=False)
     targets.to_csv(targets_path, index=False)
-    metadata_path.write_text(json.dumps(build_feature_metadata(sample, observations, config), indent=2), encoding="utf-8")
 
+
+def load_per_sample_features(sample_index_csv: str | Path = "data/processed/sample_index.csv") -> pd.DataFrame:
+    """Load and stack all per-sample gee_features.csv files."""
+
+    return _load_per_sample_table(sample_index_csv, "gee_features_csv", FEATURE_COLUMNS)
+
+
+def load_per_sample_targets(sample_index_csv: str | Path = "data/processed/sample_index.csv") -> pd.DataFrame:
+    """Load and stack all per-sample gee_targets.csv files."""
+
+    return _load_per_sample_table(sample_index_csv, "gee_targets_csv", TARGET_COLUMNS)
+
+
+def _load_per_sample_table(sample_index_csv: str | Path, path_column: str, columns: list[str]) -> pd.DataFrame:
+    """Load one kind of per-sample CSV listed in sample_index.csv."""
+
+    sample_index = load_sample_index(sample_index_csv)
+    project_root = sample_index.attrs.get("project_root", project_root_from_sample_index(sample_index_csv))
+    frames = []
+    for _, sample in sample_index.iterrows():
+        path = resolve_project_path(sample[path_column], project_root)
+        if path.exists():
+            frames.append(pd.read_csv(path))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=columns)
 
 def build_feature_metadata(sample: pd.Series, observations: pd.DataFrame, config: FeatureExtractionConfig) -> dict[str, Any]:
+    """Build reproducibility metadata for a raw GEE observation file."""
+
     dates = pd.to_datetime(observations["acquisition_date"], errors="coerce").dropna()
     end_date = dates.max().date().isoformat() if len(dates) else ""
     s2_start = (dates.min().date() - timedelta(days=config.s2_lookback_days)).isoformat() if len(dates) else ""
@@ -289,9 +461,34 @@ def build_feature_metadata(sample: pd.Series, observations: pd.DataFrame, config
 
 
 def assert_no_target_leakage(features: pd.DataFrame) -> None:
+    """Fail if future or target columns appear in model-input features."""
+
     leaks = [c for c in features.columns if c.startswith("target_") or c.startswith("future_") or "delta_1" in c]
     if leaks:
         raise ValueError(f"Future target columns found in gee_features.csv: {leaks}")
+
+
+
+def build_features_and_targets(observations: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compatibility alias for the local feature-engineering step."""
+    return engineer_features_and_targets(observations, FeatureEngineeringConfig())
+
+
+def extract_all_samples(
+    config: FeatureExtractionConfig,
+    sample_limit: int | None = None,
+    ee_module: Any | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Deprecated compatibility wrapper. Does not write combined CSV files."""
+    extract_raw_observations_from_gee(config, sample_limit=sample_limit, ee_module=ee_module)
+    engineering_config = FeatureEngineeringConfig(
+        data_dir=config.data_dir,
+        sample_index_csv=config.sample_index_csv,
+        force=True,
+        verbose=config.verbose,
+    )
+    engineer_all_samples(engineering_config, sample_limit=sample_limit)
+    return load_per_sample_features(config.sample_index_csv), load_per_sample_targets(config.sample_index_csv)
 
 def _extract_s2(ee: Any, region: Any, current_date: date, config: FeatureExtractionConfig) -> dict[str, Any]:
     collection = (
@@ -422,6 +619,8 @@ def _extract_water(ee: Any, region: Any) -> dict[str, Any]:
 
 
 def _flood_risk_proxy(df: pd.DataFrame) -> pd.Series:
+    """Combine terrain, water, rainfall, and SAR signals into a flood proxy."""
+
     heavy = _minmax(df.get("heavy_rain_days_90d"), df.index)
     water = _minmax(df.get("water_occurrence_mean"), df.index)
     flooded = _minmax(df.get("flooded_vegetation_probability"), df.index)
@@ -430,6 +629,8 @@ def _flood_risk_proxy(df: pd.DataFrame) -> pd.Series:
 
 
 def _minmax(values: pd.Series | None, index: pd.Index) -> pd.Series:
+    """Scale a series to 0-1 while tolerating missing or constant values."""
+
     if values is None:
         return pd.Series(0.0, index=index)
     series = values.astype(float)
@@ -441,10 +642,14 @@ def _minmax(values: pd.Series | None, index: pd.Index) -> pd.Series:
 
 
 def _window(current_date: date, days_before: int, days_after: int) -> tuple[str, str]:
+    """Return an ISO date window around an acquisition date."""
+
     return (current_date - timedelta(days=days_before)).isoformat(), (current_date + timedelta(days=days_after)).isoformat()
 
 
 def _safe_size(collection: Any) -> int:
+    """Return an Earth Engine collection size, falling back to zero."""
+
     try:
         return int(collection.size().getInfo())
     except Exception:
@@ -452,6 +657,8 @@ def _safe_size(collection: Any) -> int:
 
 
 def _reduce_mean(ee: Any, image: Any, region: Any, scale: int, keys: list[str]) -> dict[str, float | None]:
+    """Reduce selected Earth Engine bands to regional mean values."""
+
     try:
         values = image.reduceRegion(
             reducer=ee.Reducer.mean(),
@@ -473,6 +680,8 @@ def _reduce_mean(ee: Any, image: Any, region: Any, scale: int, keys: list[str]) 
 
 
 def _nan_values(keys: list[str], overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return a dictionary of NaN placeholders plus optional overrides."""
+
     values = {key: np.nan for key in keys}
     if overrides:
         values.update(overrides)

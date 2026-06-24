@@ -1,6 +1,6 @@
 # Satellite Sustainable Agriculture Classifier
 
-This repository contains the source code for an AML final project that builds a satellite image time-series pipeline for predicting sustainable Malaysian agriculture land into three labels:
+This repository contains the source code for an AML final project that builds a satellite image time-series and geospatial feature pipeline for predicting sustainable Malaysian agriculture land into three labels:
 
 ```text
 low / moderate / high
@@ -27,23 +27,33 @@ raw_to_be_processed/
   <latitude>_<longitude>_<label>.txt  # accepted fallback
 
 data/
-  raw/<label>/<latitude>_<longitude>/
-  processed/<label>/<latitude>_<longitude>/
+  raw/<label>/<latitude>_<longitude>_<label>/
+    original_video.mp4
+    timeline.txt
+    gee_observations.csv
+    gee_feature_metadata.json
+
+  processed/<label>/<latitude>_<longitude>_<label>/
     frame_000__YYYY-MM-DD.png
     frame_metadata.csv
-    processing_metadata.json
-    gee_observations.csv
     gee_features.csv        # model X only
     gee_targets.csv         # future/t+1 targets only
-    gee_feature_metadata.json
+
+  processed/sample_index.csv
+  processed/image_timeseries_results.csv  # future image model output
 
 notebooks/
   01_video_to_cropped_frames.ipynb
-  02_extract_gee_features.ipynb
+  02a_fetch_gee_observations.ipynb
+  02b_engineer_features_targets.ipynb
+  03_eda_and_feature_selection.ipynb
+  04_image_timeseries_urban_growth_predictor.ipynb
+  05_model_training.ipynb
 
 src/
   preprocessing/process_raw_videos.py
   features/gee_features.py
+  features/model_inputs.py
 ```
 
 The `data/` and `raw_to_be_processed/` folders are intentionally ignored by Git. Dataset files should be pulled from Hugging Face, not committed to GitHub.
@@ -65,97 +75,51 @@ conda run -n aml python -m pip install -r requirements.txt
 
 ## Pull Dataset from Hugging Face
 
-The project dataset is stored in:
-
-```text
-Aki298/AML-Satellite-Imagery-Malaysia-Copernicus
-```
-
 Download the dataset into the local `data/` folder:
 
 ```powershell
 conda run -n aml python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Aki298/AML-Satellite-Imagery-Malaysia-Copernicus', repo_type='dataset', local_dir='data', allow_patterns=['raw/**','processed/**'])"
 ```
 
-After pulling, the expected local dataset structure is:
+If `data/` already exists, Hugging Face updates matching downloaded files, but local files that no longer exist remotely may remain. For a clean refresh, move or remove the old local `data/` folder before downloading again.
 
-```text
-data/
-  raw/
-  processed/
-```
+## Pipeline Order
 
-If `data/` already exists, Hugging Face will update matching downloaded files, but local files that no longer exist in the remote dataset may remain. For a clean refresh, move or remove the old local `data/` folder before downloading again.
+1. `01_video_to_cropped_frames.ipynb`
+   - Archives MP4/timeline files under `data/raw/<label>/<sample_id>/`.
+   - Writes cropped image frames under `data/processed/<label>/<sample_id>/`.
+   - Rebuilds `data/processed/sample_index.csv`.
 
-## Preprocess MP4 Samples
+2. `02a_fetch_gee_observations.ipynb`
+   - Slow Google Earth Engine stage.
+   - Writes only raw `gee_observations.csv` and `gee_feature_metadata.json` under `data/raw`.
+   - Does not engineer features or targets.
 
-Place raw MP4 and TXT timeline files in `raw_to_be_processed/`.
+3. `02b_engineer_features_targets.ipynb`
+   - Fast local Pandas stage.
+   - Reads raw `gee_observations.csv` from `data/raw`.
+   - Applies leakage-controlled imputation.
+   - Writes per-sample `gee_features.csv` and `gee_targets.csv` under `data/processed`.
+   - Does not create `gee_features_all.csv` or `gee_targets_all.csv`.
 
-Expected naming:
+4. `03_eda_and_feature_selection.ipynb`
+   - Reads per-sample features/targets for health checks, missingness, class balance, and correlations.
+   - Does not train models.
 
-```text
-3.5165528_101.9364861_high.mp4
-3.5165528_101.9364861.txt
-```
+5. `04_image_timeseries_urban_growth_predictor.ipynb`
+   - Future image time-series model stage.
+   - Current implementation only reads image sequences and validates the expected output schema.
+   - Later output should be `data/processed/image_timeseries_results.csv`.
 
-The fallback TXT name is also accepted:
+6. `05_model_training.ipynb`
+   - Future final classifier stage.
+   - Current implementation only reads and merges GEE features, GEE targets, and optional image results.
+   - No model training is implemented yet.
 
-```text
-3.5165528_101.9364861_high.txt
-```
+## Important Rules
 
-The TXT file should contain one acquisition date per line. Line 1 maps to video timestamp `0s`, line 2 maps to `1s`, and so on.
-
-Run the pipeline:
-
-```powershell
-conda run -n aml python -m src.preprocessing.process_raw_videos
-```
-
-The pipeline archives raw files into:
-
-```text
-data/raw/<label>/<latitude>_<longitude>/
-```
-
-It saves 5%-cropped PNG frames and metadata into:
-
-```text
-data/processed/<label>/<latitude>_<longitude>/
-```
-
-It also rebuilds the central sample index used by the GEE pipeline:
-
-```text
-data/processed/sample_index.csv
-```
-
-
-## Notes
-
-- Labels are `low`, `moderate`, and `high`.
-- Current frame extraction crops 5% from each border to remove browser overlay/watermark areas.
-- `02_extract_gee_features.ipynb` creates `gee_observations.csv`, leakage-safe model inputs in `gee_features.csv`, future/t+1 targets in `gee_targets.csv`, and reproducibility details in `gee_feature_metadata.json`.
-
-
-## Extract GEE Features
-
-Set your Google Earth Engine project ID before launching Jupyter, then run notebook 02:
-
-```powershell
-$env:GEE_PROJECT_ID="your-gee-project-id"
-jupyter notebook
-```
-
-If Jupyter is already running, set `GEE_PROJECT_ID` directly in the first config cell of `02_extract_gee_features.ipynb` and rerun the initialization cell.
-
-`02_extract_gee_features.ipynb` writes per-sample files under `data/processed/<label>/<latitude>_<longitude>/`:
-
-```text
-gee_observations.csv
-gee_features.csv
-gee_targets.csv
-gee_feature_metadata.json
-```
-
-`gee_features.csv` contains model input features only. `gee_targets.csv` contains future/t+1 target columns only, so future data cannot accidentally leak into training inputs.
+- Raw GEE observations stay in `data/raw` and are not modified by feature engineering.
+- Feature imputation happens only in `02b_engineer_features_targets.ipynb`.
+- `gee_features.csv` must never contain `target_`, `future_`, or `delta_1` columns.
+- Future/t+1 values stay physically separated in `gee_targets.csv`.
+- Features and targets are per-sample files only; combined all-sample CSVs are intentionally not generated.

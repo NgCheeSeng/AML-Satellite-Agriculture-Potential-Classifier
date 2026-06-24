@@ -7,7 +7,7 @@ Expected incoming files:
       3.5165528_101.9364861.txt
 
 The MP4 filename carries the label. The preferred TXT name omits the label, but
-the legacy/current `<latitude>_<longitude>_<label>.txt` style is also accepted.
+the fallback `<latitude>_<longitude>_<label>.txt` style is also accepted.
 The TXT file contains one acquisition date per line. Line 1 maps to timestamp
 0s, line 2 maps to 1s, and so on.
 """
@@ -20,7 +20,7 @@ import json
 import re
 import shutil
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
@@ -31,12 +31,14 @@ SAMPLE_INDEX_FIELDS = [
     "label",
     "latitude",
     "longitude",
+    "raw_dir",
+    "raw_video",
+    "raw_timeline",
     "processed_dir",
     "frame_count",
     "start_date",
     "end_date",
     "frame_metadata_csv",
-    "processing_metadata_json",
     "gee_observations_csv",
     "gee_features_csv",
     "gee_targets_csv",
@@ -51,6 +53,8 @@ VIDEO_RE = re.compile(
 
 @dataclass(frozen=True)
 class RawSample:
+    """Incoming MP4 sample and its timeline file."""
+
     latitude: str
     longitude: str
     label: str
@@ -67,10 +71,33 @@ class RawSample:
 
 
 def build_sample_id(latitude: str | float, longitude: str | float, label: str) -> str:
+    """Build the canonical sample id used in raw and processed folders."""
+
     return f"{latitude}_{longitude}_{label.lower()}"
 
 
+def _project_root_from_data_dir(data_dir: Path) -> Path:
+    """Infer the project root from a data directory path."""
+
+    data_path = data_dir.resolve()
+    if data_path.name.lower() == "data":
+        return data_path.parent
+    return data_path
+
+
+def _project_relative_path(path: Path, data_dir: Path) -> str:
+    """Format a path relative to the project root when possible."""
+
+    project_root = _project_root_from_data_dir(data_dir)
+    try:
+        return str(path.resolve().relative_to(project_root))
+    except ValueError:
+        return str(path)
+
+
 def parse_video_name(video_path: Path) -> tuple[str, str, str]:
+    """Parse latitude, longitude, and label from an incoming MP4 filename."""
+
     match = VIDEO_RE.match(video_path.name)
     if not match:
         raise ValueError(
@@ -84,6 +111,8 @@ def parse_video_name(video_path: Path) -> tuple[str, str, str]:
 
 
 def read_timeline(timeline_path: Path) -> list[str]:
+    """Read and validate acquisition dates from a timeline text file."""
+
     if not timeline_path.exists():
         raise FileNotFoundError(f"Missing timeline file: {timeline_path}")
 
@@ -106,6 +135,8 @@ def read_timeline(timeline_path: Path) -> list[str]:
 
 
 def discover_samples(inbox_dir: Path) -> list[RawSample]:
+    """Find valid MP4/timeline pairs waiting to be processed."""
+
     if not inbox_dir.exists():
         raise FileNotFoundError(f"Incoming raw folder does not exist: {inbox_dir}")
 
@@ -114,9 +145,9 @@ def discover_samples(inbox_dir: Path) -> list[RawSample]:
         latitude, longitude, label = parse_video_name(video_path)
         timeline_path = inbox_dir / f"{latitude}_{longitude}.txt"
         if not timeline_path.exists():
-            legacy_timeline_path = inbox_dir / f"{latitude}_{longitude}_{label}.txt"
-            if legacy_timeline_path.exists():
-                timeline_path = legacy_timeline_path
+            fallback_timeline_path = inbox_dir / f"{latitude}_{longitude}_{label}.txt"
+            if fallback_timeline_path.exists():
+                timeline_path = fallback_timeline_path
         samples.append(
             RawSample(
                 latitude=latitude,
@@ -130,17 +161,21 @@ def discover_samples(inbox_dir: Path) -> list[RawSample]:
 
 
 def archive_raw_files(sample: RawSample, data_dir: Path) -> tuple[Path, Path, Path]:
-    raw_dir = data_dir / "raw" / sample.label / sample.coordinate_id
+    """Copy the original MP4 and timeline into the raw data folder."""
+
+    raw_dir = data_dir / "raw" / sample.label / sample.sample_id
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    archived_video = raw_dir / sample.video_path.name
-    archived_timeline = raw_dir / f"{sample.coordinate_id}.txt"
+    archived_video = raw_dir / "original_video.mp4"
+    archived_timeline = raw_dir / "timeline.txt"
     shutil.copy2(sample.video_path, archived_video)
     shutil.copy2(sample.timeline_path, archived_timeline)
     return raw_dir, archived_video, archived_timeline
 
 
 def crop_border(frame, crop_percent: float):
+    """Crop the same percentage from each frame border."""
+
     if crop_percent < 0 or crop_percent >= 50:
         raise ValueError("crop_percent must be >= 0 and < 50")
 
@@ -153,6 +188,8 @@ def crop_border(frame, crop_percent: float):
 
 
 def expected_frame_path(processed_dir: Path, index: int, acquisition_date: str) -> Path:
+    """Return the canonical PNG path for one extracted frame."""
+
     return processed_dir / f"frame_{index:03d}__{acquisition_date}.png"
 
 
@@ -161,22 +198,39 @@ def is_processed(
     dates: Iterable[str],
     crop_percent: float,
 ) -> bool:
-    metadata_path = processed_dir / "processing_metadata.json"
-    if not metadata_path.exists():
+    """Check whether the expected frame outputs already exist."""
+
+    date_list = list(dates)
+    frame_metadata_path = processed_dir / "frame_metadata.csv"
+    if not frame_metadata_path.exists():
         return False
 
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        with frame_metadata_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    except csv.Error:
         return False
-    if metadata.get("status") != "processed":
+
+    if len(rows) != len(date_list):
         return False
-    if float(metadata.get("crop_percent", -1)) != float(crop_percent):
-        return False
+
+    for index, acquisition_date in enumerate(date_list):
+        row = rows[index]
+        if str(row.get("frame_index", "")) != str(index):
+            return False
+        if row.get("acquisition_date") != acquisition_date:
+            return False
+        if row.get("image_file") != expected_frame_path(processed_dir, index, acquisition_date).name:
+            return False
+        try:
+            if float(row.get("crop_percent", -1)) != float(crop_percent):
+                return False
+        except ValueError:
+            return False
 
     expected = [
         expected_frame_path(processed_dir, index, acquisition_date)
-        for index, acquisition_date in enumerate(dates)
+        for index, acquisition_date in enumerate(date_list)
     ]
     return all(path.exists() for path in expected)
 
@@ -187,8 +241,10 @@ def extract_cropped_frames(
     crop_percent: float = 5.0,
     force: bool = False,
 ) -> dict:
+    """Extract, crop, and save all timeline-matched frames for one sample."""
+
     dates = read_timeline(sample.timeline_path)
-    processed_dir = data_dir / "processed" / sample.label / sample.coordinate_id
+    processed_dir = data_dir / "processed" / sample.label / sample.sample_id
 
     if not force and is_processed(processed_dir, dates, crop_percent):
         return {
@@ -197,7 +253,7 @@ def extract_cropped_frames(
             "label": sample.label,
             "status": "skipped",
             "reason": "already processed",
-            "processed_dir": str(processed_dir),
+            "processed_dir": _project_relative_path(processed_dir, data_dir),
             "frame_count": len(dates),
         }
 
@@ -266,40 +322,29 @@ def extract_cropped_frames(
         writer.writeheader()
         writer.writerows(frame_rows)
 
-    metadata = {
+    return {
         "latitude": float(sample.latitude),
         "longitude": float(sample.longitude),
         "label": sample.label,
         "sample_id": sample.sample_id,
         "coordinate_id": sample.coordinate_id,
-        "raw_dir": str(raw_dir),
-        "raw_video": str(archived_video),
-        "raw_timeline": str(archived_timeline),
-        "processed_dir": str(processed_dir),
+        "raw_dir": _project_relative_path(raw_dir, data_dir),
+        "raw_video": _project_relative_path(archived_video, data_dir),
+        "raw_timeline": _project_relative_path(archived_timeline, data_dir),
+        "processed_dir": _project_relative_path(processed_dir, data_dir),
         "frame_count": len(frame_rows),
         "crop_percent": crop_percent,
         "status": "processed",
-        "processed_at": datetime.now(timezone.utc).isoformat(),
-        "gee_observations_csv": str(processed_dir / "gee_observations.csv"),
-        "gee_features_csv": str(processed_dir / "gee_features.csv"),
-        "gee_targets_csv": str(processed_dir / "gee_targets.csv"),
-        "gee_feature_metadata_json": str(processed_dir / "gee_feature_metadata.json"),
+        "gee_observations_csv": _project_relative_path(raw_dir / "gee_observations.csv", data_dir),
+        "gee_features_csv": _project_relative_path(processed_dir / "gee_features.csv", data_dir),
+        "gee_targets_csv": _project_relative_path(processed_dir / "gee_targets.csv", data_dir),
+        "gee_feature_metadata_json": _project_relative_path(raw_dir / "gee_feature_metadata.json", data_dir),
     }
-    (processed_dir / "processing_metadata.json").write_text(
-        json.dumps(metadata, indent=2),
-        encoding="utf-8",
-    )
-    return metadata
-
-
-def _load_processing_metadata(metadata_path: Path) -> dict:
-    try:
-        return json.loads(metadata_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON metadata file: {metadata_path}") from exc
 
 
 def _read_frame_dates(frame_metadata_path: Path) -> tuple[int, str, str]:
+    """Return frame count plus start/end dates from frame metadata."""
+
     if not frame_metadata_path.exists():
         return 0, "", ""
     with frame_metadata_path.open(newline="", encoding="utf-8") as handle:
@@ -311,6 +356,8 @@ def _read_frame_dates(frame_metadata_path: Path) -> tuple[int, str, str]:
 
 
 def build_sample_index(data_dir: str | Path = "data") -> list[dict[str, str | int | float]]:
+    """Build sample-index rows from processed folders and frame metadata."""
+
     data_path = Path(data_dir)
     processed_root = data_path / "processed"
     rows: list[dict[str, str | int | float]] = []
@@ -320,47 +367,64 @@ def build_sample_index(data_dir: str | Path = "data") -> list[dict[str, str | in
         if not label_dir.exists():
             continue
         for sample_dir in sorted(path for path in label_dir.iterdir() if path.is_dir()):
-            metadata_path = sample_dir / "processing_metadata.json"
-            if not metadata_path.exists():
-                continue
-            metadata = _load_processing_metadata(metadata_path)
-            coordinate_id = str(metadata.get("coordinate_id") or sample_dir.name)
-            latitude = metadata.get("latitude")
-            longitude = metadata.get("longitude")
-            if latitude is None or longitude is None:
-                try:
-                    latitude_text, longitude_text = coordinate_id.split("_", 1)
-                    latitude = float(latitude_text)
-                    longitude = float(longitude_text)
-                except ValueError:
-                    latitude = ""
-                    longitude = ""
             frame_metadata_path = sample_dir / "frame_metadata.csv"
             frame_count, start_date, end_date = _read_frame_dates(frame_metadata_path)
             if not frame_count:
-                frame_count = int(metadata.get("frame_count", 0) or 0)
+                continue
+
+            sample_id = sample_dir.name
+            folder_name = sample_id
+            if folder_name.lower().endswith(f"_{label}"):
+                folder_name = folder_name[: -(len(label) + 1)]
+            try:
+                latitude_text, longitude_text = folder_name.split("_", 1)
+                latitude: str | float = float(latitude_text)
+                longitude: str | float = float(longitude_text)
+            except ValueError:
+                latitude = ""
+                longitude = ""
+
+            if not sample_id.lower().endswith(f"_{label}"):
+                sample_id = build_sample_id(latitude, longitude, label)
+
+            raw_dir = data_path / "raw" / label / sample_id
+            raw_video = raw_dir / "original_video.mp4"
+            raw_timeline = raw_dir / "timeline.txt"
+            if not raw_video.exists():
+                video_candidates = sorted(raw_dir.glob("*.mp4"))
+                if video_candidates:
+                    raw_video = video_candidates[0]
+            if not raw_timeline.exists():
+                timeline_candidates = sorted(raw_dir.glob("*.txt"))
+                if timeline_candidates:
+                    raw_timeline = timeline_candidates[0]
+
+            path_text = lambda value: _project_relative_path(value, data_path)
             rows.append(
                 {
-                    "sample_id": build_sample_id(latitude, longitude, label),
+                    "sample_id": sample_id,
                     "label": label,
                     "latitude": latitude,
                     "longitude": longitude,
-                    "processed_dir": str(sample_dir),
+                    "raw_dir": path_text(raw_dir),
+                    "raw_video": path_text(raw_video),
+                    "raw_timeline": path_text(raw_timeline),
+                    "processed_dir": path_text(sample_dir),
                     "frame_count": frame_count,
                     "start_date": start_date,
                     "end_date": end_date,
-                    "frame_metadata_csv": str(frame_metadata_path),
-                    "processing_metadata_json": str(metadata_path),
-                    "gee_observations_csv": str(sample_dir / "gee_observations.csv"),
-                    "gee_features_csv": str(sample_dir / "gee_features.csv"),
-                    "gee_targets_csv": str(sample_dir / "gee_targets.csv"),
-                    "gee_feature_metadata_json": str(sample_dir / "gee_feature_metadata.json"),
+                    "frame_metadata_csv": path_text(frame_metadata_path),
+                    "gee_observations_csv": path_text(raw_dir / "gee_observations.csv"),
+                    "gee_features_csv": path_text(sample_dir / "gee_features.csv"),
+                    "gee_targets_csv": path_text(sample_dir / "gee_targets.csv"),
+                    "gee_feature_metadata_json": path_text(raw_dir / "gee_feature_metadata.json"),
                 }
             )
     return rows
 
-
 def write_sample_index(data_dir: str | Path = "data") -> Path:
+    """Write data/processed/sample_index.csv for downstream notebooks."""
+
     data_path = Path(data_dir)
     processed_root = data_path / "processed"
     processed_root.mkdir(parents=True, exist_ok=True)
@@ -379,6 +443,8 @@ def process_inbox(
     crop_percent: float = 5.0,
     force: bool = False,
 ) -> list[dict]:
+    """Process every incoming MP4 sample and refresh the sample index."""
+
     inbox_path = Path(inbox_dir)
     data_path = Path(data_dir)
     samples = discover_samples(inbox_path)
@@ -400,6 +466,8 @@ def process_inbox(
 
 
 def main() -> None:
+    """Run the video preprocessing helper from the command line."""
+
     parser = argparse.ArgumentParser(
         description="Convert raw Copernicus MP4 files into cropped PNG frames."
     )

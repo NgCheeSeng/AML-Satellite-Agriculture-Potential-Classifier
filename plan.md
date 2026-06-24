@@ -1,8 +1,46 @@
-﻿# Concise Project Plan
+# Concise Project Plan
 
 ## Project Title
 
 **Satellite Image Time-Series Based Sustainable Agriculture Land Prediction**
+
+
+## Current Source of Truth: Split Data Pipeline
+
+The current implementation uses separation of concerns across notebooks:
+
+```text
+01_video_to_cropped_frames.ipynb
+-> 02a_fetch_gee_observations.ipynb
+-> 02b_engineer_features_targets.ipynb
+-> 03_eda_and_feature_selection.ipynb
+-> 04_image_timeseries_urban_growth_predictor.ipynb
+-> 05_model_training.ipynb
+```
+
+Storage contract:
+
+```text
+data/raw/<label>/<latitude>_<longitude>_<label>/
+  original_video.mp4
+  timeline.txt
+  gee_observations.csv
+  gee_feature_metadata.json
+
+data/processed/<label>/<latitude>_<longitude>_<label>/
+  frame_000__YYYY-MM-DD.png
+  frame_metadata.csv
+  gee_features.csv
+  gee_targets.csv
+```
+
+Rules:
+
+- GEE observations are raw downloaded data and live under `data/raw`.
+- `02a` only fetches/caches raw GEE observations.
+- `02b` reads raw observations locally, applies leakage-controlled imputation, and writes per-sample features and targets.
+- No `gee_features_all.csv` or `gee_targets_all.csv` should be generated.
+- `04_image_timeseries_urban_growth_predictor.ipynb` and `05_model_training.ipynb` currently scaffold data reading only; no model is generated in this implementation.
 
 ## 1. Project Objective
 
@@ -34,8 +72,8 @@ line 2 maps to `1s`, and so on. The preprocessing pipeline crops 5% from each
 frame border and saves labelled processed frames here:
 
 ```text
-data/raw/<label>/<latitude>_<longitude>/
-data/processed/<label>/<latitude>_<longitude>/
+data/raw/<label>/<latitude>_<longitude>_<label>/
+data/processed/<label>/<latitude>_<longitude>_<label>/
 ```
 
 The implemented notebook is:
@@ -111,7 +149,7 @@ The agriculture visualization layer is selected because it gives stronger visual
 
 Since the project currently cannot download original GeoTIFF images, each satellite image time series will first be downloaded as an MP4 from Copernicus Browser with a matching TXT timeline file. The MP4 will then be converted into cropped PNG frames using Python.
 
-The images are lossy video frames, so they will mainly be used for **visual temporal-pattern learning**, not precise spectral measurement. For accurate numerical features such as NDVI, NDWI, rainfall, temperature, and SAR indicators, Google Earth Engine or related APIs will be used later in `02_extract_gee_features.ipynb`.
+The images are lossy video frames, so they will mainly be used for **visual temporal-pattern learning**, not precise spectral measurement. For accurate numerical features such as NDVI, NDWI, rainfall, temperature, and SAR indicators, Google Earth Engine or related APIs will be used later in `02a_fetch_gee_observations.ipynb and 02b_engineer_features_targets.ipynb`.
 
 All image frames must follow the same:
 
@@ -145,7 +183,6 @@ aml_durian_agri_potential/
 |       |-- low/<latitude>_<longitude>/
 |       |   |-- frame_000__YYYY-MM-DD.png
 |       |   |-- frame_metadata.csv
-|       |   |-- processing_metadata.json
 |       |   |-- gee_features.csv
 |       |   `-- gee_targets.csv
 |       |-- moderate/<latitude>_<longitude>/
@@ -153,7 +190,7 @@ aml_durian_agri_potential/
 |
 |-- notebooks/
 |   |-- 01_video_to_cropped_frames.ipynb
-|   |-- 02_extract_gee_features.ipynb
+|   |-- 02a_fetch_gee_observations.ipynb and 02b_engineer_features_targets.ipynb
 |   |-- 03_feature_engineering.ipynb
 |   |-- 04_model_training.ipynb
 |   |-- 05_model_evaluation.ipynb
@@ -178,12 +215,12 @@ aml_durian_agri_potential/
 
 ## 6. Metadata Design
 
-Each processed sample stores metadata inside its own processed sample folder.
+Processed image metadata is stored only in `frame_metadata.csv`. The old per-sample JSON metadata file is intentionally removed because it duplicated `sample_index.csv` fields and could contain local machine paths.
 
 ### 6.1 Frame Metadata
 
 ```text
-data/processed/<label>/<latitude>_<longitude>/frame_metadata.csv
+data/processed/<label>/<latitude>_<longitude>_<label>/frame_metadata.csv
 ```
 
 Columns:
@@ -204,31 +241,7 @@ Example:
 0,0,2016-06-08,frame_000__2016-06-08.png,922,922,5.0
 ```
 
-### 6.2 Processing Metadata
-
-```text
-data/processed/<label>/<latitude>_<longitude>/processing_metadata.json
-```
-
-Fields:
-
-```text
-latitude
-longitude
-label
-sample_id
-raw_dir
-raw_video
-raw_timeline
-processed_dir
-frame_count
-crop_percent
-status
-processed_at
-gee_features_csv
-```
-
-`gee_features.csv` and `gee_targets.csv` are created later by `02_extract_gee_features.ipynb` and saved into the same processed sample folder.
+`data/processed/sample_index.csv` is rebuilt from folder names and `frame_metadata.csv`. `gee_features.csv` and `gee_targets.csv` are created later by `02b_engineer_features_targets.ipynb` and saved into the same processed sample folder.
 ---
 
 ## 7. Feature Engineering
@@ -380,7 +393,7 @@ Demo process:
 ```text
 1. Place MP4 and timeline TXT in raw_to_be_processed/.
 2. Run 01_video_to_cropped_frames.ipynb to archive raw files and create 5%-cropped PNG frames.
-3. Run 02_extract_gee_features.ipynb to save gee_features.csv and gee_targets.csv in the same processed sample folder.
+3. Run 02a_fetch_gee_observations.ipynb and 02b_engineer_features_targets.ipynb to save gee_features.csv and gee_targets.csv in the same processed sample folder.
 4. Build image time-series and tabular feature inputs.
 5. Predict urban/city growth possibility.
 6. Combine visual and environmental features.
@@ -430,13 +443,13 @@ The system can help estimate whether a land region has low, moderate, or high su
 
 ## 13. Leakage-Safe GEE Feature Outputs
 
-`02_extract_gee_features.ipynb` must physically separate model inputs from future targets:
+`02a_fetch_gee_observations.ipynb and 02b_engineer_features_targets.ipynb` must physically separate model inputs from future targets:
 
 ```text
-data/processed/<label>/<latitude>_<longitude>/gee_observations.csv
-data/processed/<label>/<latitude>_<longitude>/gee_features.csv   # model X only
-data/processed/<label>/<latitude>_<longitude>/gee_targets.csv    # future/t+1 targets only
-data/processed/<label>/<latitude>_<longitude>/gee_feature_metadata.json
+data/raw/<label>/<latitude>_<longitude>_<label>/gee_observations.csv
+data/processed/<label>/<latitude>_<longitude>_<label>/gee_features.csv   # model X only
+data/processed/<label>/<latitude>_<longitude>_<label>/gee_targets.csv    # future/t+1 targets only
+data/processed/<label>/<latitude>_<longitude>_<label>/gee_feature_metadata.json
 ```
 
 The future/t+1 targets must stay in gee_targets.csv and must never be written into gee_features.csv.

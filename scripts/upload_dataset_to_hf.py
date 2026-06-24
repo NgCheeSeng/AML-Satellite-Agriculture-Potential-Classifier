@@ -29,6 +29,8 @@ DEFAULT_IGNORE_PATTERNS = [
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line options for dataset upload."""
+
     parser = argparse.ArgumentParser(
         description="Upload the local data/ folder to Hugging Face Datasets."
     )
@@ -79,6 +81,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def iter_upload_files(data_dir: Path) -> list[Path]:
+    """List uploadable files under the local data directory."""
+
     if not data_dir.exists():
         raise FileNotFoundError(f"Dataset folder does not exist: {data_dir}")
     if not data_dir.is_dir():
@@ -92,6 +96,8 @@ def iter_upload_files(data_dir: Path) -> list[Path]:
 
 
 def _is_ignored(path: Path, data_dir: Path) -> bool:
+    """Return whether a local file should be skipped."""
+
     relative = path.relative_to(data_dir)
     parts = set(relative.parts)
     if parts.intersection(IGNORE_DIR_NAMES):
@@ -100,6 +106,8 @@ def _is_ignored(path: Path, data_dir: Path) -> bool:
 
 
 def normalize_path_in_repo(path_in_repo: str) -> str:
+    """Normalize a Hugging Face repo subfolder path."""
+
     path = path_in_repo.strip().replace("\\", "/").strip("/")
     return "" if path == "." else path
 
@@ -110,6 +118,8 @@ def build_delete_patterns(
     replace: bool,
     extra_patterns: list[str],
 ) -> list[str] | None:
+    """Combine replace and user-supplied remote delete patterns."""
+
     patterns: list[str] = []
     if replace:
         patterns.extend(build_replace_delete_patterns(data_dir, path_in_repo))
@@ -118,6 +128,8 @@ def build_delete_patterns(
 
 
 def build_replace_delete_patterns(data_dir: Path, path_in_repo: str) -> list[str]:
+    """Build remote delete patterns for a replace-style upload."""
+
     patterns: list[str] = []
     for child in sorted(data_dir.iterdir(), key=lambda item: item.name):
         if child.name in IGNORE_FILE_NAMES or child.name in IGNORE_DIR_NAMES:
@@ -130,6 +142,8 @@ def build_replace_delete_patterns(data_dir: Path, path_in_repo: str) -> list[str
 
 
 def remote_pattern(pattern: str, path_in_repo: str) -> str:
+    """Prefix a remote delete pattern with the target repo folder."""
+
     pattern = pattern.strip().replace("\\", "/").strip("/")
     if not path_in_repo:
         return pattern
@@ -137,6 +151,8 @@ def remote_pattern(pattern: str, path_in_repo: str) -> str:
 
 
 def remote_upload_path(relative_path: Path, path_in_repo: str) -> str:
+    """Build the destination path for one uploaded file."""
+
     relative = relative_path.as_posix()
     if not path_in_repo:
         return relative
@@ -144,6 +160,8 @@ def remote_upload_path(relative_path: Path, path_in_repo: str) -> str:
 
 
 def format_size(num_bytes: int) -> str:
+    """Format byte counts for console output."""
+
     size = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB"):
         if size < 1024 or unit == "GB":
@@ -153,6 +171,8 @@ def format_size(num_bytes: int) -> str:
 
 
 def summarize_upload_files(files: list[Path], data_dir: Path) -> tuple[int, dict[str, int], dict[str, int]]:
+    """Summarize upload size and counts by top-level folder."""
+
     total_bytes = 0
     folder_counts: dict[str, int] = {}
     folder_sizes: dict[str, int] = {}
@@ -174,6 +194,8 @@ def print_upload_plan(
     delete_patterns: list[str] | None,
     include_file_list: bool,
 ) -> None:
+    """Print a dry-run style summary of the upload operation."""
+
     total_bytes, folder_counts, folder_sizes = summarize_upload_files(files, data_dir)
     print(f"Dataset repo: {repo_id}")
     print(f"Local folder: {data_dir}")
@@ -199,6 +221,8 @@ def upload_dataset(
     commit_message: str,
     delete_patterns: list[str] | None,
 ) -> str:
+    """Upload the local data folder to the Hugging Face dataset repo."""
+
     try:
         from huggingface_hub import HfApi
         from huggingface_hub.errors import HfHubHTTPError
@@ -234,6 +258,8 @@ def upload_dataset(
 
 
 def main() -> None:
+    """Run the Hugging Face dataset upload script."""
+
     args = parse_args()
     data_dir = Path(args.data_dir).resolve()
     path_in_repo = normalize_path_in_repo(args.path_in_repo)
