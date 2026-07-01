@@ -1,7 +1,13 @@
-opencv-python
-huggingface_hub
 earthengine-api
-geemap
+huggingface_hub
 pandas
 numpy
+scikit-learn
+matplotlib
+joblib
 tqdm
+pyyaml
+pyproj
+torch
+torchvision
+torchaudio

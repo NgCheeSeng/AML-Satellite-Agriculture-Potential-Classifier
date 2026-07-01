@@ -1,88 +1,190 @@
-# Satellite Sustainable Agriculture Classifier
+# Sagil Monthly GEE Environmental Risk Forecasting
 
-This repository contains the source code for an AML final project that builds a satellite image time-series and geospatial feature pipeline for predicting sustainable Malaysian agriculture land into three labels:
+This repository builds a monthly Google Earth Engine time-series dataset for agricultural grid cells in Sagil, Tangkak, Johor, then prototypes an environmental anomaly index and one-month-ahead flood/drought proxy-risk forecast.
 
-```text
-low / moderate / high
-```
+The learned score is an environmental anomaly and directional risk proxy derived from remote-sensing and reanalysis variables. It is not a direct disaster observation and must not be interpreted as a calibrated probability or percentage of agricultural land flooded or affected by drought.
 
-The source code is hosted on GitHub:
+Dataset repository:
 
 ```text
-git@github.com:NgCheeSeng/AML-Satellite-Sustainable-Agriculture-Classifier.git
-```
-
-The dataset is hosted separately on Hugging Face:
-
-```text
-https://huggingface.co/datasets/Aki298/AML-Satellite-Imagery-Malaysia-Copernicus
+https://huggingface.co/datasets/Aki298/AML-Johor-Tangkak-Sagil-GEE-dataset
 ```
 
 ## Project Structure
 
 ```text
-raw_to_be_processed/
-  <latitude>_<longitude>_<label>.mp4
-  <latitude>_<longitude>.txt
-  <latitude>_<longitude>_<label>.txt  # accepted fallback
+config/
+  project_config.yaml
 
 data/
-  raw/<label>/<latitude>_<longitude>_<label>/
-    original_video.mp4
-    timeline.txt
-    gee_observations.csv
-    gee_feature_metadata.json
-
-  processed/<label>/<latitude>_<longitude>_<label>/
-    frame_000__YYYY-MM-DD.png
-    frame_metadata.csv
-    gee_features.csv        # model X only
-    gee_targets.csv         # future/t+1 targets only
-
-  processed/sample_index.csv
-  processed/image_timeseries_results.csv  # future image model output
+  input/coordinates.csv          # tracked manual coordinate source
+  metadata/sample_index.csv      # generated
+  metadata/extraction_manifest.json
+  raw/monthly/<sample_id>.csv    # generated per-cell monthly observations
+  processed/processed_data.csv   # generated deterministic model table
 
 notebooks/
-  01_video_to_cropped_frames.ipynb
-  02a_fetch_gee_observations.ipynb
-  02b_engineer_features_targets.ipynb
-  03_eda_and_feature_selection.ipynb
-  04_image_timeseries_urban_growth_predictor.ipynb
-  05_model_training.ipynb
+  01_GEE_observation_extraction.ipynb
+  02_feature_engineering.ipynb
+  03_risk_scoring_and_forecasting.ipynb
+  04_lstm_risk_forecasting.ipynb
+  05_transformer_risk_forecasting.ipynb
+  06_demo_coordinate_forecast.ipynb
 
 src/
-  preprocessing/process_raw_videos.py
-  features/gee_features.py
-  features/model_inputs.py
+  gee_monthly_extraction.py
+  monthly_feature_engineering.py
+  risk_scoring.py
+  transformer_forecasting.py
+  demo_inference.py
+  validation.py
+
+scripts/
+  predict_demo_coordinate.py
+  repair_pytorch_cpu.py
+
+artifacts/                      # generated models/scalers/thresholds
+reports/                        # generated metrics/predictions
 ```
 
-The `data/` and `raw_to_be_processed/` folders are intentionally ignored by Git. Dataset files should be pulled from Hugging Face, not committed to GitHub.
+## Coordinate Input
+
+Edit and track:
+
+```text
+data/input/coordinates.csv
+```
+
+Required columns:
+
+```text
+sample_id,grid_row,grid_col,latitude,longitude
+```
+
+Optional columns:
+
+```text
+study_area,cell_size_m,notes
+```
+
+Recommended sample IDs use stable grid names, for example `sagil_r00_c00`. Do not use latitude/longitude as primary filenames.
+
+Each row is treated as the centroid of a 1,000 m x 1,000 m grid cell. The square is built in `EPSG:32648` using a 500 m half-width, then transformed to WGS84 for Earth Engine.
+
+## Monthly GEE Dataset
+
+The configured period is inclusive month starts:
+
+```text
+2021-01-01 through 2026-06-01
+```
+
+This shorter period reduces noise from older observations and creates 66 rows per coordinate. Each Earth Engine query uses the interval:
+
+```text
+[month_start, next_month_start)
+```
+
+The final month `2026-06-01` queries through `2026-07-01`.
+
+Source datasets include Sentinel-2, Sentinel-1, CHIRPS, ERA5-Land, Dynamic World, SRTM, and JRC Global Surface Water. Monthly reducers follow the physical meaning of each variable: medians/means for indices and probabilities, sums for rainfall/runoff/evaporation totals, counts for dry/heavy-rain days, and static terrain/water values repeated per month.
+
+## Pipeline
+
+1. `01_GEE_observation_extraction.ipynb`
+   - Reads `data/input/coordinates.csv`.
+   - Validates coordinate uniqueness, month schedule, and 1 km cell geometry.
+   - Writes per-cell raw monthly CSVs to `data/raw/monthly/`.
+   - Writes `data/metadata/sample_index.csv` and `data/metadata/extraction_manifest.json`.
+
+2. `02_feature_engineering.ipynb`
+   - Reads `data/metadata/sample_index.csv` and raw monthly CSVs.
+   - Validates monthly continuity and unique `(sample_id, month)` keys.
+   - Keeps all raw observations and adds a reduced hydrology-focused set of calendar, lag, rolling, and difference features.
+   - Writes `data/processed/processed_data.csv`.
+   - Does not create learned anomaly scores, future targets, or model predictions.
+
+3. `03_risk_scoring_and_forecasting.ipynb`
+   - Loads `data/processed/processed_data.csv`.
+   - Fits training-only imputers/scalers/reconstruction models.
+   - Creates anomaly magnitude, flood/drought direction scores, severity thresholds, and one-month-ahead proxy targets.
+   - Trains persistence, Ridge, and a reduced 100-tree Random Forest.
+   - Saves all trained models, per-model prediction reports, and best-RMSE generic prediction reports.
+   - Plots model metrics, test diagnostics, and holdout predictions.
+
+4. `04_lstm_risk_forecasting.ipynb`
+   - Reuses the same scored forecasting table and chronological splits.
+   - Requires PyTorch and trains a real LSTM sequence regressor.
+   - Attempts the local PyTorch CPU repair helper if PyTorch import fails, then raises clearly if LSTM cannot run.
+   - Saves LSTM sequence artifacts for demo inference when this notebook is run.
+   - Plots sequence training history, model comparison, test diagnostics, and holdout predictions.
+
+5. `05_transformer_risk_forecasting.ipynb`
+   - Reuses the same scored forecasting table and chronological splits.
+   - Builds 12-month sequences and trains a compact PyTorch Transformer encoder.
+   - Saves Transformer artifacts, predictions, metrics, and a model-comparison report.
+   - Updates the generic best-model reports only when Transformer has the lowest test RMSE.
+   - This is an advanced optional comparison model and may not outperform simpler models on the small current dataset.
+
+6. `06_demo_coordinate_forecast.ipynb`
+   - Runs the live or offline coordinate demo in a separate notebook.
+   - Loads trained artifacts from notebooks 03, 04, and 05 without retraining.
+   - Writes and visualizes `reports/demo_coordinate_prediction.csv`.
+
+## Temporal Split
+
+All learned transformations are fitted after splitting logic is defined. Forecast rows are split by `target_month`:
+
+```text
+train:   target_month <= 2025-05-01
+test:    2025-06-01 <= target_month <= 2026-05-01
+holdout: target_month == 2026-06-01
+```
+
+The observation period starts at `2021-01-01`. After the one-month target shift, supervised training uses source rows from `2021-01-01` onward and target months through `2025-05-01`. The holdout target month `2026-06-01` uses source features from `2026-05-01`. The June 2026 source row has no July 2026 target and is excluded from supervised evaluation.
+
+## Live Coordinate Demo
+
+Use `06_demo_coordinate_forecast.ipynb` or the demo script to predict `month+1` risk for a coordinate inside the selected Sagil square. The coordinate is treated as the centroid of a 1 km x 1 km cell. By default the workflow uses the latest complete month and downloads enough recent history to compute the reduced lag/rolling features.
+
+```powershell
+conda run -n aml python scripts/predict_demo_coordinate.py --latitude 2.31386663 --longitude 102.6555956
+```
+
+For an offline smoke test using an existing raw monthly CSV:
+
+```powershell
+conda run -n aml python scripts/predict_demo_coordinate.py --latitude 2.32289114 --longitude 102.6465942 --sample-id demo_sagil_1 --source-month 2026-05-01 --raw-csv data/raw/monthly/sagil_1.csv
+```
+
+The output is written to `reports/demo_coordinate_prediction.csv`.
+
+When `artifacts/transformer_model_metadata.json` exists, the demo also attempts a Transformer prediction and uses it only if `artifacts/model_registry.json` marks Transformer as the best model.
 
 ## Environment Setup
-
-Use the project conda environment:
 
 ```powershell
 conda activate aml
 python -m pip install -r requirements.txt
 ```
 
-Or run commands without activating:
+If PyTorch import fails on Windows, run the local CPU repair helper:
 
 ```powershell
-conda run -n aml python -m pip install -r requirements.txt
+python scripts/repair_pytorch_cpu.py
 ```
 
+The helper verifies `import torch` first and only reinstalls CPU wheels when the import fails. It uses the official PyTorch CPU wheel index for the Windows/Pip/CPU install path.
 
-## Google Earth Engine Credentials
+Official PyTorch local install guidance: https://pytorch.org/get-started/locally/
 
-Create a local credentials file for the Earth Engine project id. This file is ignored by Git.
+For Earth Engine, set `GEE_PROJECT_ID` or create ignored local credentials:
 
-```powershell
-Copy-Item config\gee_credentials.example.json config\gee_credentials.json
+```text
+config/gee_credentials.json
 ```
 
-Edit `config\gee_credentials.json` and set:
+with:
 
 ```json
 {
@@ -90,55 +192,10 @@ Edit `config\gee_credentials.json` and set:
 }
 ```
 
-`02a_fetch_gee_observations.ipynb` also accepts `GEE_PROJECT_ID` from the environment, but the local credentials file avoids hardcoding the project id in notebooks.
-
 ## Pull Dataset from Hugging Face
 
-Download the dataset into the local `data/` folder:
-
 ```powershell
-conda run -n aml python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Aki298/AML-Satellite-Imagery-Malaysia-Copernicus', repo_type='dataset', local_dir='data', allow_patterns=['raw/**','processed/**'])"
+conda run -n aml python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Aki298/AML-Johor-Tangkak-Sagil-GEE-dataset', repo_type='dataset', local_dir='data')"
 ```
 
-If `data/` already exists, Hugging Face updates matching downloaded files, but local files that no longer exist remotely may remain. For a clean refresh, move or remove the old local `data/` folder before downloading again.
-
-## Pipeline Order
-
-1. `01_video_to_cropped_frames.ipynb`
-   - Archives MP4/timeline files under `data/raw/<label>/<sample_id>/`.
-   - Writes cropped image frames under `data/processed/<label>/<sample_id>/`.
-   - Rebuilds `data/processed/sample_index.csv`.
-
-2. `02a_fetch_gee_observations.ipynb`
-   - Slow Google Earth Engine stage.
-   - Writes only raw `gee_observations.csv` and `gee_feature_metadata.json` under `data/raw`.
-   - Does not engineer features or targets.
-
-3. `02b_engineer_features_targets.ipynb`
-   - Fast local Pandas stage.
-   - Reads raw `gee_observations.csv` from `data/raw`.
-   - Applies leakage-controlled imputation.
-   - Writes per-sample `gee_features.csv` and `gee_targets.csv` under `data/processed`.
-   - Does not create `gee_features_all.csv` or `gee_targets_all.csv`.
-
-4. `03_eda_and_feature_selection.ipynb`
-   - Reads per-sample features/targets for health checks, missingness, class balance, and correlations.
-   - Does not train models.
-
-5. `04_image_timeseries_urban_growth_predictor.ipynb`
-   - Future image time-series model stage.
-   - Current implementation only reads image sequences and validates the expected output schema.
-   - Later output should be `data/processed/image_timeseries_results.csv`.
-
-6. `05_model_training.ipynb`
-   - Future final classifier stage.
-   - Current implementation only reads and merges GEE features, GEE targets, and optional image results.
-   - No model training is implemented yet.
-~
-## Important Rules
-
-- Raw GEE observations stay in `data/raw` and are not modified by feature engineering.
-- Feature imputation happens only in `02b_engineer_features_targets.ipynb`.
-- `gee_features.csv` must never contain `target_`, `future_`, or `delta_1` columns.
-- Future/t+1 values stay physically separated in `gee_targets.csv`.
-- Features and targets are per-sample files only; combined all-sample CSVs are intentionally not generated.
+Generated data, artifacts, and reports are intentionally ignored by Git except `data/input/coordinates.csv`.

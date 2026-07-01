@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 
 
-DEFAULT_REPO_ID = "Aki298/AML-Satellite-Imagery-Malaysia-Copernicus"
+DEFAULT_REPO_ID = "Aki298/AML-Johor-Tangkak-Sagil-GEE-dataset"
 DEFAULT_DATA_DIR = "data"
 IGNORE_FILE_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 IGNORE_DIR_NAMES = {"__pycache__", ".ipynb_checkpoints"}

@@ -40,12 +40,16 @@ desktop.ini
 .codex/
 .agents/
 
-# Raw incoming and generated dataset artifacts
-raw_to_be_processed/
+# Generated dataset artifacts
 data/raw/
 data/processed/
-data/interim/
-data/external/
+data/metadata/sample_index.csv
+data/metadata/extraction_manifest.json
+
+# Model artifacts and generated reports
+artifacts/
+reports/*.csv
+reports/*.json
 
 # Large/generated media and arrays
 *.mp4
